@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+
+# Copyright (C) 2016 Bernhard Ehlers
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""
+ova_import generates gns3a file to import ova appliance into GNS3.
+
+usage: ova_import [-h] [-d DIR] ova
+
+positional arguments:
+  ova                .ova appliance
+
+optional arguments:
+  -h, --help         show this help message and exit
+  -d DIR, --dir DIR  directory for storing gns3a appliance
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+import tarfile
+import xml.etree.ElementTree as ElementTree
+from collections import defaultdict, OrderedDict
+
+
+# strip namespace from tag
+def strip_namespace(tag):
+    if '}' in tag:
+        tag = tag.split('}', 1)[1]      # strip all namespaces
+    return tag
+
+
+# convert ElementTree to dictionary
+# see K3---rnc's answer of "Converting xml to dictionary using ElementTree"
+# http://stackoverflow.com/questions/7684333/converting-xml-to-dictionary-using-elementtree#answer-10076823
+def etree_to_dict(t):
+    tag = strip_namespace(t.tag)
+    d = {tag: {} if t.attrib else None}
+    children = list(t)
+    if children:
+        dd = defaultdict(list)
+        for dc in map(etree_to_dict, children):
+            for k, v in dc.items():
+                dd[k].append(v)
+        d = {tag: {k:v[0] if len(v) == 1 else v for k, v in dd.items()}}
+    if t.attrib:
+        d[tag].update((strip_namespace(k), v) for k, v in t.attrib.items())
+    if t.text:
+        text = t.text.strip()
+        if children or t.attrib:
+            if text:
+              d[tag]['#text'] = text
+        else:
+            d[tag] = text
+    return d
+
+
+# create GNS3 appliance file
+def create_gns3a(fname, dname, file_info, ovf_data):
+    fbase = os.path.basename(fname)
+    gns3a = OrderedDict()
+    ovf = etree_to_dict(ElementTree.fromstring(ovf_data))['Envelope']
+
+    # base informations
+    try:
+        vm_name = ovf['VirtualSystem']['Name']
+    except KeyError:
+        vm_name = ovf['VirtualSystem']['id']
+    gns3a["name"]             = vm_name
+    gns3a["category"]         = "guest"
+    gns3a["description"]      = "ova import of " + fbase
+    gns3a["vendor_name"]      = "unknown"
+    gns3a["vendor_url"]       = "http://www.example.com"
+    gns3a["product_name"]     = vm_name
+    gns3a["registry_version"] = 1
+    gns3a["status"]           = "experimental"
+    gns3a["maintainer"]       = "GNS3 Team"
+    gns3a["maintainer_email"] = "developers@gns3.net"
+
+    # qemu
+    qemu = OrderedDict()
+    qemu["adapter_type"] = "e1000"
+    adapters = 0;
+    for item in ovf['VirtualSystem']['VirtualHardwareSection']['Item']:
+        if item['ResourceType'] == '10':
+            adapters += 1
+    qemu["adapters"] = max(adapters, 1)
+    qemu["ram"] = 256
+    for item in ovf['VirtualSystem']['VirtualHardwareSection']['Item']:
+        if item['ResourceType'] == '4':
+            qemu["ram"] = int(item['VirtualQuantity'])
+            break
+    try:
+        vm_os = ovf['VirtualSystem']['OperatingSystemSection']['osType']
+    except KeyError:
+        vm_os = ovf['VirtualSystem']['OperatingSystemSection']['OSType']['#text']
+    qemu["arch"] = "i386"
+    if "64" in vm_os:
+        qemu["arch"] = "x86_64"
+    qemu["console_type"] = "telnet"
+    qemu["kvm"] = "allow"
+    for item in ovf['VirtualSystem']['VirtualHardwareSection']['Item']:
+        if item['ResourceType'] == '3':
+            cores = int(item['VirtualQuantity'])
+            if cores > 1:
+                qemu["options"] = "-smp " + str(cores)
+            break
+    gns3a["qemu"] = qemu
+
+    # images
+    images = []
+    for name in sorted(file_info.keys()):
+        image = OrderedDict()
+        image["filename"] = name
+        image["version"]  = "0.0"
+        image["md5sum"]   = file_info[name]["md5"]
+        image["filesize"] = file_info[name]["len"]
+        images.append(image)
+    gns3a["images"] = images
+
+    # versions
+    images = OrderedDict()
+    cdrom = None
+    disk_id = 0
+    ovf_ref_file = ovf['References']['File']
+    if not (isinstance(ovf_ref_file, list) or isinstance(ovf_ref_file, tuple)):
+        ovf_ref_file = [ ovf_ref_file ]
+    for image in ovf_ref_file:
+        img = image['href']
+        if img.endswith(".iso"):
+            if cdrom is None:
+                cdrom = img
+        else:
+            images["hd" + chr(ord("a")+disk_id) + "_disk_image"] = img
+            disk_id += 1
+    if cdrom is not None:
+        images["cdrom_image"] = cdrom
+    gns3a["versions"] = [ OrderedDict([("name", "0.0"), ("images", images)]) ]
+
+    # write to file
+    ofile = os.path.join(dname, os.path.splitext(fbase)[0] + ".gns3a")
+    with open(ofile, "w") as f:
+        json.dump(gns3a, f, indent=4)
+        f.write("\n")
+
+
+# main
+
+# parse command line
+parser = argparse.ArgumentParser(description='%(prog)s generates gns3a file to import ova appliance into GNS3.')
+parser.add_argument('-d', '--dir', default='',
+                    help='directory for storing gns3a appliance')
+parser.add_argument('ova', help='.ova appliance')
+args = parser.parse_args()
+
+fname = args.ova
+dname = args.dir
+
+if dname != '' and not os.path.isdir(dname):
+    sys.stderr.write("Directory '{}' doesn't exist.\n".format(dname))
+    sys.exit(1)
+
+# open ovf file
+try:
+    tar = tarfile.open(fname)
+except (IOError, tarfile.TarError) as err:
+    sys.stderr.write("Error reading ova file: {}\n".format(err))
+    sys.exit(1)
+
+# get files from ova
+file_info = {}
+ovf_data = None
+
+for tarinfo in tar:
+    if not tarinfo.isfile():            # ova should include only regular files
+        continue
+    if tarinfo.name.endswith(".ovf"):   # ovf file
+        f = tar.extractfile(tarinfo)
+        ovf_data = f.read()
+        f.close()
+    else:                               # save image file
+        name = tarinfo.name.split('/')[-1]
+        out_name = os.path.join(dname, name)
+        f_len = 0
+        f_md5 = hashlib.md5()
+        f_in = tar.extractfile(tarinfo)
+        with open(out_name, 'wb') as f_out:
+            while True:
+                block = f_in.read(64 * 1024)
+                if len(block) == 0:
+                    break
+                f_out.write(block)
+                f_len += len(block)
+                f_md5.update(block)
+        f_in.close()
+        f_out.close()
+        os.utime(out_name, (tarinfo.mtime, tarinfo.mtime))
+        file_info[name] = {'len': f_len, 'md5': f_md5.hexdigest()}
+
+tar.close()
+
+if ovf_data is None:
+    sys.stderr.write("No ovf information in ova.\n")
+    sys.exit(1)
+
+create_gns3a(fname, dname, file_info, ovf_data)
